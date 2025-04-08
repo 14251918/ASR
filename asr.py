@@ -342,7 +342,7 @@ functions_name(args) — если есть аргументы,
         else:
             print("Данный тип файла не поддерживается.")
 
-model = ASR()
+model = ASR(file_path=r"presentation.pptx")
 model.run_powerPoint()
 model.read_file()
 model.start_audio()
