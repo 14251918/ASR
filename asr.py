@@ -22,7 +22,7 @@ os.environ["GROQ_API_KEY"] = "API_KEY"
 
 class ASR:
     def __init__(self,
-                 file_path="presentation.pptx",
+                 file_path,
                  sample_rate=16000,
                  LLM_model_name="gemma2-9b-it"
                  ):
