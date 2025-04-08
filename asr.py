@@ -19,6 +19,7 @@ import wave
 from groq import Groq
 
 os.environ["GROQ_API_KEY"] = "API_KEY"
+file_path = r"presentation.pptx"
 
 class ASR:
     def __init__(self,
@@ -342,7 +343,7 @@ functions_name(args) — если есть аргументы,
         else:
             print("Данный тип файла не поддерживается.")
 
-model = ASR(file_path=r"presentation.pptx")
+model = ASR(file_path=file_path)
 model.run_powerPoint()
 model.read_file()
 model.start_audio()
