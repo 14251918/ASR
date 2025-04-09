@@ -45,7 +45,7 @@ class ASR:
         self.file_path = file_path
         if not os.path.isabs(file_path):
             self.file_path = os.path.abspath(self.file_path)
-            self.file_path = self.file_path.replace("\\", "//")
+        self.file_path = self.file_path.replace("\\", "//")
         self.extension = os.path.splitext(self.file_path)[-1].lower()
         self.was_audio = 0
         self.was_audio_recognized = 0
