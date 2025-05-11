@@ -1,349 +1,342 @@
+import collections
 import datetime
-import json
 import os
-import re
 
-from langchain_core.output_parsers import StrOutputParser
-from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
-import fitz
-from pptx import Presentation
+import webrtcvad
+from langchain_mistralai import ChatMistralAI
 import queue
 import threading
 import time
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 import win32com.client
 import io
-import wave
 from groq import Groq
 
-os.environ["GROQ_API_KEY"] = "API_KEY"
+from dotenv import load_dotenv
+
+from ListNode import ListNode
+from read_file import read_file
+from langchain_core.tools import tool
+
+from langgraph.graph import START, END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+
+from langchain_core.prompts.chat import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+    MessagesPlaceholder
+)
+
+
+from pydantic import BaseModel
+from typing import List
+from collections import deque
+from langchain_core.messages import BaseMessage
+
+from config import Settings
+
+load_dotenv()
+settings = Settings()
+
+
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
+
+frame_size = int(settings.sample_rate * settings.frame_duration_ms / 1000)
+last_recognize_time = 0
+block_size = frame_size
+vad = webrtcvad.Vad(0)
+
+channels = 1
+dtype = "float32"
+buffer = np.array([])
 file_path = r"presentation.pptx"
+ppAPP = None
+slide_contexts = None
+slide_contexts_json = None
+count_slides = None
+slideshow = None
+presentation_settings = None
+presentation = None
 
-class ASR:
-    def __init__(self,
-                 file_path,
-                 sample_rate=16000,
-                 LLM_model_name="gemma2-9b-it"
-                 ):
-        self.ppAPP = None
-        self.slide_contexts = None
-        self.count_slides = None
-        self.slideshow = None
-        self.presentation_settings = None
-        self.presentation = None
-        self.sample_rate = sample_rate
-        self.blocksize = self.sample_rate * 2
-        self.min_louds = self.sample_rate * 0.1
-        self.min_speach = int(self.sample_rate * 0.5)
-        self.max_speech = self.sample_rate * 4
-        self.mean_back = 0
-        self.channels = 1
-        self.dtype = "float32"
-        self.buffer = np.array([])
-        self.file_path = file_path
-        if not os.path.isabs(file_path):
-            self.file_path = os.path.abspath(self.file_path)
-        self.file_path = self.file_path.replace("\\", "//")
-        self.extension = os.path.splitext(self.file_path)[-1].lower()
-        self.was_audio = 0
-        self.was_audio_recognized = 0
-        self.was_LLM_recognized = 0
-        self.commands = {
-            "next_slide",
-            "prev_slide",
-            "close_slideshow",
-            "move_to_slide",
-            "no_move"
-        }
-        self.command_queue = queue.Queue()
-        self.client = Groq()
-        self.model_name = LLM_model_name
-        self.model = ChatGroq(model_name=self.model_name, temperature=0)
-        self.output_parser = StrOutputParser()
+if not os.path.isabs(file_path):
+    file_path = os.path.abspath(file_path)
+file_path = file_path.replace("\\", "//")
+was_audio = 0
+was_audio_recognized = 0
+was_LLM_recognized = 0
+num_padding_frames = int(settings.padding_ms / settings.frame_duration_ms)
+vad_ring = deque(maxlen=num_padding_frames)
+vad_voices = []
+vad_triggered = False
+command_queue = queue.Queue()
+client = Groq()
+# model = ChatGroq(model_name=settings.llm_model_name, temperature=0)
+model = ChatMistralAI(model=settings.llm_model_name, temperature=0)
+history_slide = ListNode()
 
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.blocksize,
-            channels=self.channels,
-            callback=self.audio_callback,
-            dtype=self.dtype
-        )
+slide_contexts_json = read_file(file_path=file_path)
+slide_contexts_str = "\n".join(
+    [f"Слайд {slide['slide_number']}: {slide['slide_context']}" for slide in slide_contexts_json])
+system_template = SystemMessagePromptTemplate.from_template(settings.system_instructions)
 
 
+human_message = HumanMessagePromptTemplate.from_template(settings.human_template)
 
-        self.template_to_command = '''
-Ты - ассистент-помощник для переключения слайдов.
-Дана распознанная речь, возможно, с ошибками: {recognized_speech}. 
+chat_prompt = ChatPromptTemplate.from_messages([
+    system_template,
+    MessagesPlaceholder("messages"),
+    human_message
+])
 
-Текущий слайд: {slide_now}.
-Контекст слайдов (в формате JSON): """{slide_context}""" Контекст закончен.
+chat_prompt = chat_prompt.partial(slide_context=slide_contexts_str)
 
-Твоя задача - вывести функцию для управления слайдами на основе распознанной речи.
-Доступные функции:
-- next_slide: Перейти на следующий слайд.
-- prev_slide: Перейти на предыдущий слайд.
-- close_slideshow: Закрыть презентацию.
-- move_to_slide(num_slide): Перейти на слайд с номером num_slide.
-- no_move: Ничего не делать, если нет команды управления.
 
-Важно:
-- Используй next_slide, если сказано "следующий", "дальше", "перейти на следующий слайд" и т.п.
-- Используй prev_slide, если сказано "предыдущий", "назад", "вернуться" и т.п.
-- Используй move_to_slide(num_slide), если указан конкретный номер слайда, например, "перейти на слайд 5", "десятый слайд".
-Для последнего или первого слайда также используются числа
-- Если речь не содержит явной команды управления слайдами, используй no_move.
-Без додумывания. Пользователь должен  обратиться к тебе для переключения, или в речи есть слова, подходящие к контексту слайда.
-Твой ответ должен быть в формате:
-functions_name(args) — если есть аргументы,
-или просто functions_name — если аргументов нет.
+@tool
+def next_slide():
+    """Move to the next slide"""
+    if count_slides > slideshow.View.Slide.SlideIndex:
+        print("Переход на следующий слайд.")
+        slideshow.View.Next()
+    else:
+        print("Это последний слайд.")
 
-**Не добавляй никаких дополнительных символов, тегов (например, ```python) или объяснений в первой строке ответа.**
-Объяснение пиши после пустой строки.
 
-Примеры:
-- Распознанная речь: "следующий" → next_slide
-- Распознанная речь: "следующий слайд" → next_slide
-- Распознанная речь: "перейти на слайд 3" → move_to_slide(3)
-- Распознанная речь: "десятый слайд" → move_to_slide(10)
-- Распознанная речь: "какой сейчас слайд" → no_move
+@tool
+def prev_slide():
+    """Move to 1 slide back"""
+    if slideshow.View.Slide.SlideIndex > 1:
+        print("Переход на предыдущий слайд.")
+        slideshow.View.Previous()
+    else:
+        print("Это первый слайд.")
 
-Учти, что это примеры.
-Это не распознанная речь. Распознанная речь - в начале.
-Также учти, что ошибки в словах могут быть значительны. 
-Например, слово слойт - может быть словом слайд и т.п.
 
-'''
-
-        self.prompt_command = PromptTemplate(
-            input_variables=["slide_now",
-                             "slide_context",
-                             "recognized_speech",
-                             "functions_name"],
-            template=self.template_to_command
-        )
-        self.chain_command = (self.prompt_command |
-                              self.model |
-                              self.output_parser)
-
-    def run_powerPoint(self, file_path=""):
-        if file_path:
-            self.file_path = file_path
-        if not os.path.exists(self.file_path):
-            print(f"Такого файла {self.file_path} не существует")
-            return
-        try:
-            self.ppAPP = win32com.client.GetActiveObject("PowerPoint.Application")
-        except Exception as e:
-            self.ppAPP = win32com.client.Dispatch("PowerPoint.Application")
-            self.ppAPP.Visible = True
-        try:
-            self.presentation = self.ppAPP.Presentations.Open(self.file_path)
-            self.presentation_settings = self.presentation.SlideShowSettings
-            self.presentation_settings.Run()
-            for _ in range(5):
-                if self.ppAPP.SlideShowWindows.Count:
-                    self.slideshow = self.ppAPP.SlideShowWindows(1)
-                    break
-                time.sleep(1)
-            self.count_slides = self.presentation.Slides.Count
-
-        except Exception as e:
-            print(f"Ошибка: {e}. Пожалуйста, укажите полный путь к презентации.")
-            if self.ppAPP:
-                self.ppAPP.Quit()
-
-    def next_slide(self):
-        if self.count_slides > self.slideshow.View.Slide.SlideIndex:
-            self.slideshow.View.Next()
+@tool
+def move_to_slide(slide_number: str):
+    """Move to n-th slide"""
+    try:
+        slide_number = int(slide_number)
+        if 1 <= slide_number <= count_slides:
+            print(f"Переход к {slide_number} слайду.")
+            slideshow.View.GotoSlide(slide_number)
         else:
-            print("Это последний слайд.")
-
-    def prev_slide(self):
-        if self.slideshow.View.Slide.SlideIndex > 1:
-            self.slideshow.View.Previous()
-        else:
-            print("Это первый слайд.")
-
-    def move_to_slide(self, slide_number):
-        try:
-            slide_number = int(slide_number)
-            if 1 <= slide_number <= self.count_slides:
-                self.slideshow.View.GotoSlide(slide_number)
-            else:
-                print(f"Недопустимый номер слайда {slide_number}.")
-        except ValueError:
-            print("Недопустимый номер слайда. Ожидалось число.")
-
-    def close_slideshow(self):
-        if self.slideshow:
-            self.slideshow.View.Exit()
-
-    def no_move(self):
-        print("Ничего не делать. Выполнено!")
-
-    def __exit__(self):
-        if self.ppAPP:
-            self.ppAPP.DisplayAlerts = False
-            self.ppAPP.Quit()
-        del self.ppAPP
-
-    def asr(self, audio):
-        def recognize(audio_to_rec):
-            if np.max(np.abs(audio_to_rec)) != 0:
-                audio_to_rec = audio_to_rec / np.max(np.abs(audio_to_rec))
-            audio_to_rec = np.int16(audio_to_rec * 32767)
-            with io.BytesIO() as wav_buffer:
-                with wave.open(wav_buffer, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(self.sample_rate)
-                    wf.writeframes(audio_to_rec.tobytes())
-                wav_buffer.seek(0)
-
-                recognized_text = self.client.audio.transcriptions.create(
-                    file=("recording.wav", wav_buffer),
-                    # model="whisper-large-v3",
-                    model="whisper-large-v3-turbo",
-                    language="ru",
-                    response_format="text"
-                )
-            self.was_audio_recognized += 1
-            print(f"Аудио №{self.was_audio_recognized} распознано в {datetime.datetime.now()}.")
-            print(f"Распознанная речь : {recognized_text}")
-            self.command_queue.put(recognized_text.strip().lower())
-
-        threading.Thread(target=recognize, args=(audio,)).start()
-
-    def audio_callback(self, indata, frames, time, status, alpha=0.2):
-        indata = indata.squeeze()
-        mean = np.mean(np.abs(indata))
-        self.mean_back = alpha * mean + (1 - alpha) * self.mean_back
-
-        loud_frames = sum(abs(i) > self.mean_back * 2 + 0.001 for i in indata)
-
-        def start_recognize():
-            self.was_audio += 1
-            print(f"Обработка аудио №{self.was_audio} начата в {datetime.datetime.now()}")
-            self.asr(self.buffer.copy())
-            self.buffer = self.buffer[-self.min_speach:]
-
-        if loud_frames > self.min_louds and len(self.buffer) < self.max_speech:
-            print(loud_frames, self.mean_back)
-            self.buffer = np.append(self.buffer, indata)
-            if len(self.buffer) >= self.max_speech:
-                start_recognize()
-        elif len(self.buffer) > self.min_speach:
-            start_recognize()
-        else:
-            self.buffer = np.array([])
+            print(f"Недопустимый номер слайда {slide_number}.")
+    except ValueError:
+        print("Недопустимый номер слайда. Ожидалось число.")
 
 
-    def process_command(self, recognized_speech):
-        try:
-            self.was_LLM_recognized += 1
-            num = self.was_LLM_recognized
-            print(f"Обработка команды №{num} начата в {datetime.datetime.now()}.")
-            slide_now = self.slideshow.View.Slide.SlideIndex
-            functions_name = ', '.join(self.commands)
-            now_time = datetime.datetime.now()
-            output = self.chain_command.invoke(
-                {"slide_now": slide_now,
-                 "slide_context": json.dumps(self.slide_contexts, ensure_ascii=False),
-                 "recognized_speech": recognized_speech,
-                 "functions_name": functions_name}
+@tool
+def close_slideshow():
+    """Close slideshow"""
+    if slideshow:
+        print("Презентация закрыта.")
+        slideshow.View.Exit()
+
+@tool
+def back_slide():
+    """Return to slide what was before this"""
+    global history_slide
+    if history_slide.prev:
+        history_slide = history_slide.prev
+    print(f"Возвращение обратно на {history_slide.val} слайд.")
+    move_to_slide.invoke(str(history_slide.val))
+
+
+@tool
+def no_move():
+    """Doing nothing if not need to do something"""
+    print("Ничего не делать. Выполнено!")
+
+
+tools = [next_slide, prev_slide, move_to_slide, close_slideshow, back_slide, no_move]
+
+model_with_tools = model.bind_tools(tools)
+
+prompt_and_model = chat_prompt | model_with_tools
+
+
+class PresentationState(BaseModel):
+    messages: List[BaseMessage]
+    recognized_speech: str
+    slide_now: int
+
+
+def model_node(state: PresentationState):
+    input_dict = {
+        "messages": state.messages,
+        "recognized_speech": state.recognized_speech,
+        "slide_now": state.slide_now
+    }
+    result = prompt_and_model.invoke(input_dict)
+    all_messages = state.messages + [result]
+    trimmed_messages = all_messages[-5:]
+    return {"messages": trimmed_messages}
+
+
+workflow = (StateGraph(PresentationState)
+            .add_node("model", model_node)
+            .add_edge(START, "model")
+            .add_edge("model", END)
             )
-            print(f"Команда №{num} обработана в {datetime.datetime.now()}.")
-            print(f"Распознанный текст: {recognized_speech}, Ответ LLM: {output}")
-            match = re.search(r'(\w+)(?:\((\d+)\))?', output)
-            if match:
-                fun_name = match.group(1)
-                args_str = match.group(2) if match.group(2) else None
-                print(f"Команда: {fun_name}, аргументы: {args_str}")
-            else:
-                print("Команда не найдена в ответе LLM")
-                return
 
-            if fun_name in self.commands:
-                action = fun_name
-                print(f"Найдена команда: {action}")
+memory = MemorySaver()
+model_with_history = workflow.compile(checkpointer=memory)
+config = {"configurable": {"thread_id": "unique"}}
+
+
+def run_powerPoint(file_path_pptx=""):
+    global file_path, count_slides, ppAPP, presentation, presentation_settings, slideshow
+    if file_path_pptx:
+        file_path = file_path_pptx
+    if not os.path.exists(file_path):
+        print(f"Такого файла {file_path} не существует")
+        return
+    try:
+        ppAPP = win32com.client.GetActiveObject("PowerPoint.Application")
+    except Exception as e:
+        ppAPP = win32com.client.Dispatch("PowerPoint.Application")
+        ppAPP.Visible = True
+    try:
+        presentation = ppAPP.Presentations.Open(file_path)
+        presentation_settings = presentation.SlideShowSettings
+        presentation_settings.Run()
+        for _ in range(10):
+            if ppAPP.SlideShowWindows.Count:
+                slideshow = ppAPP.SlideShowWindows(1)
+                break
+            time.sleep(1)
+        count_slides = presentation.Slides.Count
+
+    except Exception as e:
+        print(f"Ошибка: {e}. Пожалуйста, укажите полный путь к презентации.")
+
+
+def exit_pp():
+    global ppAPP
+    if ppAPP:
+        print("PowerPoint закрыт")
+        ppAPP.DisplayAlerts = False
+        ppAPP.Quit()
+    del ppAPP
+
+def recognize(vad_frames_bytes, chunk_id):
+    global last_recognize_time
+    now = time.time()
+    if now - last_recognize_time < settings.min_gap:
+        print("Пропущено")
+        return
+    last_recognize_time = time.time()
+    print(f"Аудио №{chunk_id} отправлено на распознавание в {datetime.datetime.now()}")
+    audio_int16 = np.frombuffer(vad_frames_bytes, dtype=np.int16)
+    audio_float = audio_int16.astype(np.float32) / 32767
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, audio_float, samplerate=settings.sample_rate, format="WAV", subtype="PCM_16")
+    wav_buffer.seek(0)
+
+    recognized_text = client.audio.transcriptions.create(
+        file=("recording.wav", wav_buffer),
+        model=settings.asr_model_name,
+        language=settings.language,
+        response_format="text"
+    )
+    print(f"Распознан текст: {recognized_text}")
+    process_command(recognized_text)
+
+
+def audio_callback(indata, frames, time, status):
+    global was_audio, vad_ring, vad_voices, vad_triggered
+    frame = indata.flatten()
+
+    pcm = (frame * 32767).astype(np.int16).tobytes()
+    is_speech = vad.is_speech(pcm, settings.sample_rate)
+    if not vad_triggered:
+        vad_ring.append((pcm, is_speech))
+        voices = sum(1 for _, s in vad_ring if s)
+        if voices > settings.ratio * vad_ring.maxlen:
+            vad_triggered = True
+            vad_voices = [p for p, _ in vad_ring]
+            vad_ring.clear()
+    else:
+        vad_voices.append(pcm)
+        vad_ring.append((pcm, is_speech))
+        silences = sum(1 for _, s in vad_ring if not s)
+        if silences > settings.ratio * vad_ring.maxlen:
+            segment = b"".join(vad_voices)
+            vad_triggered = False
+            vad_ring.clear()
+            vad_voices =[]
+            was_audio += 1
+            chunk_id = was_audio
+            threading.Thread(target=recognize, args=(segment,chunk_id)).start()
+
+def process_command(recognized_speech):
+    try:
+        global was_LLM_recognized
+        was_LLM_recognized += 1
+        print(f"Обработка команды №{was_LLM_recognized} начата в {datetime.datetime.now()}.")
+        slide_now = history_slide.val
+        state = PresentationState(
+            messages=[],
+            recognized_speech=recognized_speech,
+            slide_now=slide_now
+        )
+
+        # current_state = model_with_history.checkpointer.get(config=config)
+        # if current_state:
+        #     print(f"История: {current_state}")
+        # else:
+        #     print("Истории нет")
+
+        output = model_with_history.invoke(input=state, config=config)
+        print(f"Команда №{was_LLM_recognized} с текстом {recognized_speech} обработана в {datetime.datetime.now()}.")
+        messages = output.get("messages", [])
+        if not messages or not hasattr(messages[-1], "tool_calls"):
+            print("Не был вызван tools.")
+            return
+        command_queue.put(messages[-1].tool_calls[0])
+
+    except Exception as e:
+        print(f"Ошибка при обработке распознанной речи: {e}.")
+
+def do_command(tool_call):
+    global history_slide
+    tool_name = tool_call["name"]
+    tool_args = tool_call["args"]
+    print(f"tool: {tool_name}, args: {tool_args}")
+    for tool in tools:
+        if tool.name == tool_name:
+            tool.invoke(input=tool_args)
+            slide_now = slideshow.View.Slide.SlideIndex
+            if slide_now != history_slide.val:
+                history_slide = ListNode(val=slide_now, prev=history_slide)
+                print(f"В историю добавлен {history_slide.val}, предыдущий: {history_slide.prev.val}")
+            break
+
+def start_audio():
+    with sd.InputStream(
+        samplerate=settings.sample_rate,
+        blocksize=block_size,
+        channels=channels,
+        callback=audio_callback,
+        dtype=dtype
+    ):
+        print("Запись начата")
+        try:
+            while True:
                 try:
-                    if args_str:
-                        if args_str.isdigit():
-                            getattr(self, action)(int(args_str))
-                        else:
-                            print(f"Недопустимый аргумент: {args_str}")
-                    else:
-                        getattr(self, action)()
-                except Exception as e:
-                    print(f"Ошибка при выполнении команды: {e}")
-            else:
-                print(f"Неизвестная команда {fun_name}")
-        except Exception as e:
-            print(f"Ошибка при обработке распознанной речи: {e}")
+                    command = command_queue.get_nowait()
+                    print("Команда обрабатывается.")
+                    do_command(command)
+                except queue.Empty:
+                    time.sleep(0.001)
+        except KeyboardInterrupt:
+            print("Запись остановлена.")
 
-
-    def start_audio(self):
-        with self.stream:
-            print("Запись начата")
-            try:
-                while True:
-                    try:
-                        recognized_speech = self.command_queue.get_nowait()
-                        print("Команда обрабатывается.")
-                        self.process_command(recognized_speech)
-                    except queue.Empty:
-                        time.sleep(0.1)
-            except KeyboardInterrupt:
-                print("Запись остановлена")
-                self.__exit__()
-
-
-    def read_file_pdf(self, pdf_path=''):
-        if pdf_path:
-            self.file_path = pdf_path
-            self.extension = os.path.splitext(self.file_path)[-1].lower()
-        self.slide_contexts = {}
-        try:
-            pdf_doc = fitz.open(self.file_path)
-            for page_num in range(pdf_doc.page_count):
-                page = pdf_doc.load_page(page_num)
-                text = page.get_textpage()
-                self.slide_contexts[str(page_num + 1)] = text.extractText()
-            pdf_doc.close()
-        except Exception as e:
-            print(f"Ошибка извлечения из PDF: {e}")
-
-    def read_file_pptx(self, pptx_path=''):
-        if pptx_path:
-            self.file_path = pptx_path
-            self.extension = os.path.splitext(self.file_path)[-1].lower()
-        self.slide_contexts = {}
-        try:
-            present = Presentation(self.file_path)
-            for i, slide in enumerate(present.slides):
-                text = ""
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        text += shape.text + "\n"
-                self.slide_contexts[str(i + 1)] = text.strip()
-        except Exception as e:
-            print(f"Ошибка извлечения из PPTX: {e}")
-
-
-    def read_file(self, file_path=''):
-        if file_path:
-            self.file_path = file_path
-            self.extension = os.path.splitext(self.file_path)[-1].lower()
-        if self.extension == ".pdf":
-            self.read_file_pdf(self.file_path)
-        elif self.extension == ".pptx":
-            self.read_file_pptx(self.file_path)
-        else:
-            print("Данный тип файла не поддерживается.")
-
-model = ASR(file_path=file_path)
-model.run_powerPoint()
-model.read_file()
-model.start_audio()
+try:
+    run_powerPoint()
+    start_audio()
+finally:
+    exit_pp()
