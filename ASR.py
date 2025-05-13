@@ -1,88 +1,53 @@
-import collections
 import datetime
+import io
 import os
-
-import webrtcvad
-from langchain_mistralai import ChatMistralAI
 import queue
 import threading
 import time
+from collections import deque
+from typing import List
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import win32com.client
-import io
-from groq import Groq
-
+import webrtcvad
 from dotenv import load_dotenv
-
-from ListNode import ListNode
-from read_file import read_file
-from langchain_core.tools import tool
-
-from langgraph.graph import START, END, StateGraph
-from langgraph.checkpoint.memory import MemorySaver
-
+from groq import Groq
+from langchain_core.messages import BaseMessage
 from langchain_core.prompts.chat import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
-    MessagesPlaceholder
+    MessagesPlaceholder,
 )
-
-
+from langchain_mistralai import ChatMistralAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import START, END, StateGraph
 from pydantic import BaseModel
-from typing import List
-from collections import deque
-from langchain_core.messages import BaseMessage
 
-from config import Settings
+from LinkedList import LinkedList
+from PresentationSettings import presentation
+from config import settings
+from tools import tools
 
 load_dotenv()
-settings = Settings()
-
 
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
+os.environ["MISTRAL_API_KEY"] = os.getenv("MISTRAL_API_KEY")
 
 frame_size = int(settings.sample_rate * settings.frame_duration_ms / 1000)
 last_recognize_time = 0
-block_size = frame_size
 vad = webrtcvad.Vad(0)
 
-channels = 1
-dtype = "float32"
-buffer = np.array([])
-file_path = r"presentation.pptx"
-ppAPP = None
-slide_contexts = None
-slide_contexts_json = None
-count_slides = None
-slideshow = None
-presentation_settings = None
-presentation = None
-
-if not os.path.isabs(file_path):
-    file_path = os.path.abspath(file_path)
-file_path = file_path.replace("\\", "//")
-was_audio = 0
-was_audio_recognized = 0
-was_LLM_recognized = 0
 num_padding_frames = int(settings.padding_ms / settings.frame_duration_ms)
 vad_ring = deque(maxlen=num_padding_frames)
 vad_voices = []
 vad_triggered = False
 command_queue = queue.Queue()
-client = Groq()
 # model = ChatGroq(model_name=settings.llm_model_name, temperature=0)
 model = ChatMistralAI(model=settings.llm_model_name, temperature=0)
-history_slide = ListNode()
 
-slide_contexts_json = read_file(file_path=file_path)
-slide_contexts_str = "\n".join(
-    [f"Слайд {slide['slide_number']}: {slide['slide_context']}" for slide in slide_contexts_json])
 system_template = SystemMessagePromptTemplate.from_template(settings.system_instructions)
-
-
 human_message = HumanMessagePromptTemplate.from_template(settings.human_template)
 
 chat_prompt = ChatPromptTemplate.from_messages([
@@ -91,67 +56,10 @@ chat_prompt = ChatPromptTemplate.from_messages([
     human_message
 ])
 
-chat_prompt = chat_prompt.partial(slide_context=slide_contexts_str)
+chat_prompt = chat_prompt.partial(slide_context=presentation.slide_contexts_str)
 
-
-@tool
-def next_slide():
-    """Move to the next slide"""
-    if count_slides > slideshow.View.Slide.SlideIndex:
-        print("Переход на следующий слайд.")
-        slideshow.View.Next()
-    else:
-        print("Это последний слайд.")
-
-
-@tool
-def prev_slide():
-    """Move to 1 slide back"""
-    if slideshow.View.Slide.SlideIndex > 1:
-        print("Переход на предыдущий слайд.")
-        slideshow.View.Previous()
-    else:
-        print("Это первый слайд.")
-
-
-@tool
-def move_to_slide(slide_number: str):
-    """Move to n-th slide"""
-    try:
-        slide_number = int(slide_number)
-        if 1 <= slide_number <= count_slides:
-            print(f"Переход к {slide_number} слайду.")
-            slideshow.View.GotoSlide(slide_number)
-        else:
-            print(f"Недопустимый номер слайда {slide_number}.")
-    except ValueError:
-        print("Недопустимый номер слайда. Ожидалось число.")
-
-
-@tool
-def close_slideshow():
-    """Close slideshow"""
-    if slideshow:
-        print("Презентация закрыта.")
-        slideshow.View.Exit()
-
-@tool
-def back_slide():
-    """Return to slide what was before this"""
-    global history_slide
-    if history_slide.prev:
-        history_slide = history_slide.prev
-    print(f"Возвращение обратно на {history_slide.val} слайд.")
-    move_to_slide.invoke(str(history_slide.val))
-
-
-@tool
-def no_move():
-    """Doing nothing if not need to do something"""
-    print("Ничего не делать. Выполнено!")
-
-
-tools = [next_slide, prev_slide, move_to_slide, close_slideshow, back_slide, no_move]
+was_audio = 0
+was_LLM_recognized = 0
 
 model_with_tools = model.bind_tools(tools)
 
@@ -172,7 +80,7 @@ def model_node(state: PresentationState):
     }
     result = prompt_and_model.invoke(input_dict)
     all_messages = state.messages + [result]
-    trimmed_messages = all_messages[-5:]
+    trimmed_messages = all_messages[-settings.history_size:]
     return {"messages": trimmed_messages}
 
 
@@ -185,42 +93,6 @@ workflow = (StateGraph(PresentationState)
 memory = MemorySaver()
 model_with_history = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "unique"}}
-
-
-def run_powerPoint(file_path_pptx=""):
-    global file_path, count_slides, ppAPP, presentation, presentation_settings, slideshow
-    if file_path_pptx:
-        file_path = file_path_pptx
-    if not os.path.exists(file_path):
-        print(f"Такого файла {file_path} не существует")
-        return
-    try:
-        ppAPP = win32com.client.GetActiveObject("PowerPoint.Application")
-    except Exception as e:
-        ppAPP = win32com.client.Dispatch("PowerPoint.Application")
-        ppAPP.Visible = True
-    try:
-        presentation = ppAPP.Presentations.Open(file_path)
-        presentation_settings = presentation.SlideShowSettings
-        presentation_settings.Run()
-        for _ in range(10):
-            if ppAPP.SlideShowWindows.Count:
-                slideshow = ppAPP.SlideShowWindows(1)
-                break
-            time.sleep(1)
-        count_slides = presentation.Slides.Count
-
-    except Exception as e:
-        print(f"Ошибка: {e}. Пожалуйста, укажите полный путь к презентации.")
-
-
-def exit_pp():
-    global ppAPP
-    if ppAPP:
-        print("PowerPoint закрыт")
-        ppAPP.DisplayAlerts = False
-        ppAPP.Quit()
-    del ppAPP
 
 def recognize(vad_frames_bytes, chunk_id):
     global last_recognize_time
@@ -236,7 +108,7 @@ def recognize(vad_frames_bytes, chunk_id):
     sf.write(wav_buffer, audio_float, samplerate=settings.sample_rate, format="WAV", subtype="PCM_16")
     wav_buffer.seek(0)
 
-    recognized_text = client.audio.transcriptions.create(
+    recognized_text = Groq().audio.transcriptions.create(
         file=("recording.wav", wav_buffer),
         model=settings.asr_model_name,
         language=settings.language,
@@ -277,11 +149,10 @@ def process_command(recognized_speech):
         global was_LLM_recognized
         was_LLM_recognized += 1
         print(f"Обработка команды №{was_LLM_recognized} начата в {datetime.datetime.now()}.")
-        slide_now = history_slide.val
         state = PresentationState(
             messages=[],
             recognized_speech=recognized_speech,
-            slide_now=slide_now
+            slide_now=presentation.history_slide.val
         )
 
         # current_state = model_with_history.checkpointer.get(config=config)
@@ -302,26 +173,26 @@ def process_command(recognized_speech):
         print(f"Ошибка при обработке распознанной речи: {e}.")
 
 def do_command(tool_call):
-    global history_slide
     tool_name = tool_call["name"]
     tool_args = tool_call["args"]
     print(f"tool: {tool_name}, args: {tool_args}")
     for tool in tools:
         if tool.name == tool_name:
             tool.invoke(input=tool_args)
-            slide_now = slideshow.View.Slide.SlideIndex
-            if slide_now != history_slide.val:
-                history_slide = ListNode(val=slide_now, prev=history_slide)
-                print(f"В историю добавлен {history_slide.val}, предыдущий: {history_slide.prev.val}")
+            slide_now = presentation.slideshow.View.Slide.SlideIndex
+            if slide_now != presentation.history_slide.val:
+                presentation.history_slide = LinkedList(val=slide_now, prev=presentation.history_slide)
+                print(f"В историю добавлен {presentation.history_slide.val}, "
+                      f"предыдущий: {presentation.history_slide.prev.val}")
             break
 
 def start_audio():
     with sd.InputStream(
         samplerate=settings.sample_rate,
-        blocksize=block_size,
-        channels=channels,
+        blocksize=frame_size,
+        channels=1,
         callback=audio_callback,
-        dtype=dtype
+        dtype="float32"
     ):
         print("Запись начата")
         try:
@@ -336,7 +207,7 @@ def start_audio():
             print("Запись остановлена.")
 
 try:
-    run_powerPoint()
+    presentation.run_powerPoint()
     start_audio()
 finally:
-    exit_pp()
+    presentation.exit_pp()
