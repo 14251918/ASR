@@ -1,30 +1,29 @@
+import os
+import json
+import base64
+import hashlib
+import asyncio
+import httpx 
+from dotenv import load_dotenv
+
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+
+from lxml import etree
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from langchain_mistralai.chat_models import ChatMistralAI
 from langchain_core.messages import HumanMessage
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from dotenv import load_dotenv
-
-import asyncio
-
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-from lxml import etree
-import os
-import base64
-import hashlib
-import json
-import httpx
 
 load_dotenv()
 os.environ["MISTRAL_API_KEY"] = os.getenv("MISTRAL_API_KEY")
+
 model_context = ChatMistralAI(
     model="pixtral-large-latest",
     temperature=0.0
 )
-
-output_image_dir = "extracted_images"
-os.makedirs(output_image_dir, exist_ok=True)
 
 def compute_slide_hash(slide):
     hasher = hashlib.sha256()
@@ -180,8 +179,7 @@ async def process_presentation(file_path):
         return
     try:
         context_file_name = os.path.splitext(os.path.basename(file_path))[0]
-        file_hash = hashlib.sha256(file_path.encode()).hexdigest()[:8]
-        output_context_json = f"{context_file_name}.{file_hash}.json"
+        output_context_json = f"{context_file_name}.json"
 
         pres = Presentation(file_path)
         slides = list(pres.slides)
